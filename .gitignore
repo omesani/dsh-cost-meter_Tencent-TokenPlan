@@ -1,0 +1,13 @@
+# 本地密钥与运行时产物，绝不提交
+*.env
+.env
+!examples/*.env.example
+*.log
+node_modules/
+backups/
+.DS_Store
+
+# 任何疑似密钥文件
+*.pem
+*.key
+secrets*
