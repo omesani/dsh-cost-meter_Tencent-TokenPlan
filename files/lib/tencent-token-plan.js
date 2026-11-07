@@ -1,27 +1,18 @@
 /**
- * dsh-cost-meter「腾讯 Token Plan 个人版」额度查询 adapter（原生接入）。
+ * dsh-cost-meter adapter：腾讯云 TokenHub「通用 Token Plan 个人版」额度。
  *
- * 官方资料:
- *  - 套餐详情(企业版 DescribeTokenPlan): https://cloud.tencent.com/document/product/1823/132270
- *  - 套餐列表(企业版 DescribeTokenPlanList): https://cloud.tencent.com/document/product/1823/132269
- *  - 公共参数 / 地域 / service=tokenhub: https://cloud.tencent.com/document/api/1823/132283
- *  - 签名方法 v3(TC3-HMAC-SHA256): https://cloud.tencent.com/document/api/1823/132284
- *  - 个人版档位(通用 Standard = 1980 积分/订阅月): https://cloud.tencent.com/document/product/1823/130060
- *  - 个人版积分抵扣规则: https://cloud.tencent.com/document/product/1823/133811
+ * 请求：POST tokenhub.tencentcloudapi.com，Action=DescribeTokenPlanPersonalPackage，
+ * Version=2026-03-22，service=tokenhub，TC3-HMAC-SHA256 签名（SecretKey 仅本地派生，不出站）。
+ * 企业版对照 Action=DescribeTokenPlan（需 TeamId，文档 132270）。
  *
- * 个人版实际调用 DescribeTokenPlanPersonalPackage(与 132270 同域名 / 同 Version /
- * 同签名,不需要 TeamId,以 ProductType 区分通用版 personal 与 Hy 版 personal-hunyuan)。
- * 也可用 TENCENT_TOKENPLAN_ACTION=DescribeTokenPlan + TENCENT_TOKENPLAN_TEAM_ID 切到
- * 132270 文档口径的企业版接口。
- *
- * 接口只回传用量/剩余积分,没有百分比。完整比例由本模块自行计算:
- *   maxBudget = 1980(月积分总量,可由 TENCENT_TOKENPLAN_MONTHLY_CREDITS 覆盖)
- *   spend     = maxBudget - credit
+ * 接口只返回用量/剩余积分，不返回百分比，因此按固定月总量自行计算完整比例：
+ *   maxBudget = 1980（通用 Standard 档，可用 TENCENT_TOKENPLAN_MONTHLY_CREDITS 覆盖）
  *   remaining = credit
- * 由 dsh-cost-meter 的自定义余额框架按 remaining / maxBudget 渲染进度条与百分比。
+ *   spend     = maxBudget - credit
+ * 由自定义余额框架按 remaining / maxBudget 渲染进度条与百分比。
  *
- * 密钥只用于本地 TC3 HMAC 派生,SecretKey 绝不出站;SecretId 只出现在
- * Authorization 的 Credential 里。不读取、不回传响应中的账户身份字段。
+ * 文档：132270（企业版详情）、132269（套餐列表）、132283（公共参数）、
+ * 132284（签名 v3）、130060（档位与积分）、133811（积分抵扣规则）。
  */
 import { createHash, createHmac } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -31,57 +22,57 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { fetchWithRetry, readJsonBounded } from './net.js'
 import { balanceHttpError } from './balance-retry.js'
 
-export const TENCENT_TOKENPLAN_HOST = 'tokenhub.tencentcloudapi.com'
-export const TENCENT_TOKENPLAN_URL = `https://${TENCENT_TOKENPLAN_HOST}/`
-export const TENCENT_TOKENPLAN_SERVICE = 'tokenhub'
-export const TENCENT_TOKENPLAN_VERSION = '2026-03-22'
-export const TENCENT_TOKENPLAN_DEFAULT_REGION = 'ap-guangzhou'
-export const TENCENT_TOKENPLAN_MONTHLY_CREDITS = 1980
+const HOST = 'tokenhub.tencentcloudapi.com'
+const SERVICE = 'tokenhub'
+const VERSION = '2026-03-22'
+const DEFAULT_REGION = 'ap-guangzhou'
+const DEFAULT_ACTION = 'DescribeTokenPlanPersonalPackage'
+const DEFAULT_PRODUCT_TYPE = 'personal'
 
-/** 自定义余额卡片里显示的凭据输入框(customVar:<NAME>),顺序即 UI 顺序。 */
+export const TENCENT_TOKENPLAN_URL = `https://${HOST}/`
+export const TENCENT_TOKENPLAN_MONTHLY_CREDITS = 1980
+/** 设置页显示的凭据输入框（customVar:<NAME>），顺序即 UI 顺序。 */
 export const TENCENT_TOKENPLAN_CREDENTIAL_VARS = [
   'TENCENTCLOUD_SECRET_ID',
   'TENCENTCLOUD_SECRET_KEY',
   'TENCENT_TOKENPLAN_TEAM_ID',
 ]
 
-const SECRET_ID_NAMES = ['TENCENTCLOUD_SECRET_ID', 'TENCENT_TOKENPLAN_SECRET_ID', 'TENCENT_SECRET_ID']
-const SECRET_KEY_NAMES = ['TENCENTCLOUD_SECRET_KEY', 'TENCENT_TOKENPLAN_SECRET_KEY', 'TENCENT_SECRET_KEY']
+const ID_NAMES = ['TENCENTCLOUD_SECRET_ID', 'TENCENT_TOKENPLAN_SECRET_ID', 'TENCENT_SECRET_ID']
+const KEY_NAMES = ['TENCENTCLOUD_SECRET_KEY', 'TENCENT_TOKENPLAN_SECRET_KEY', 'TENCENT_SECRET_KEY']
 const TOKEN_NAMES = ['TENCENTCLOUD_TOKEN', 'TENCENTCLOUD_SESSION_TOKEN']
-const TEAM_ID_NAMES = ['TENCENT_TOKENPLAN_TEAM_ID', 'TENCENTCLOUD_TOKENPLAN_TEAM_ID']
+const TEAM_NAMES = ['TENCENT_TOKENPLAN_TEAM_ID', 'TENCENTCLOUD_TOKENPLAN_TEAM_ID']
 
 const sha256hex = value => createHash('sha256').update(value, 'utf8').digest('hex')
 const hmac = (key, value) => createHmac('sha256', key).update(value, 'utf8').digest()
 
 /**
- * 生成腾讯云 API 3.0 TC3-HMAC-SHA256 签名请求。
- * 纯函数(时间戳可注入),便于单元测试。
+ * 生成 TC3-HMAC-SHA256 签名请求。纯函数（时间戳可注入），便于测试。
+ * 注意：签名日期按 UTC 计算，东八区凌晨不能直接用本地日期。
  */
 export function signTencentTokenPlanRequest(secretId, secretKey, {
-  action = 'DescribeTokenPlanPersonalPackage',
+  action = DEFAULT_ACTION,
   payload = '{}',
-  region = TENCENT_TOKENPLAN_DEFAULT_REGION,
+  region = DEFAULT_REGION,
   timestamp = Math.floor(Date.now() / 1000),
   token = '',
 } = {}) {
-  const date = new Date(timestamp * 1000).toISOString().slice(0, 10) // UTC,不是东八区
+  const date = new Date(timestamp * 1000).toISOString().slice(0, 10)
   const contentType = 'application/json; charset=utf-8'
   const signedHeaders = 'content-type;host'
-  const canonicalHeaders = `content-type:${contentType}\nhost:${TENCENT_TOKENPLAN_HOST}\n`
+  const canonicalHeaders = `content-type:${contentType}\nhost:${HOST}\n`
   const canonicalRequest = ['POST', '/', '', canonicalHeaders, signedHeaders, sha256hex(payload)].join('\n')
-  const credentialScope = `${date}/${TENCENT_TOKENPLAN_SERVICE}/tc3_request`
-  const stringToSign = ['TC3-HMAC-SHA256', String(timestamp), credentialScope, sha256hex(canonicalRequest)].join('\n')
-  const secretDate = hmac(`TC3${secretKey}`, date)
-  const secretService = hmac(secretDate, TENCENT_TOKENPLAN_SERVICE)
-  const secretSigning = hmac(secretService, 'tc3_request')
-  const signature = createHmac('sha256', secretSigning).update(stringToSign, 'utf8').digest('hex')
+  const scope = `${date}/${SERVICE}/tc3_request`
+  const stringToSign = ['TC3-HMAC-SHA256', String(timestamp), scope, sha256hex(canonicalRequest)].join('\n')
+  const signingKey = hmac(hmac(hmac(`TC3${secretKey}`, date), SERVICE), 'tc3_request')
+  const signature = createHmac('sha256', signingKey).update(stringToSign, 'utf8').digest('hex')
   const headers = {
-    authorization: `TC3-HMAC-SHA256 Credential=${secretId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+    authorization: `TC3-HMAC-SHA256 Credential=${secretId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
     'content-type': contentType,
-    host: TENCENT_TOKENPLAN_HOST,
+    host: HOST,
     'x-tc-action': action,
     'x-tc-timestamp': String(timestamp),
-    'x-tc-version': TENCENT_TOKENPLAN_VERSION,
+    'x-tc-version': VERSION,
     'x-tc-region': region,
     'user-agent': 'dsh-cost-meter/1.9 (DeepSeek Harness plugin)',
   }
@@ -89,264 +80,205 @@ export function signTencentTokenPlanRequest(secretId, secretKey, {
   return { method: 'POST', headers, body: payload, redirect: 'manual' }
 }
 
-const number = value => {
+const toNumber = value => {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
-  if (typeof value === 'string' && value.trim() !== '') {
-    const n = Number(value.trim())
-    return Number.isFinite(n) ? n : null
-  }
-  return null
+  if (typeof value !== 'string' || value.trim() === '') return null
+  const n = Number(value.trim())
+  return Number.isFinite(n) ? n : null
 }
+const atPath = (obj, path) => String(path).split('.').reduce(
+  (cur, key) => (cur !== null && typeof cur === 'object' ? cur[key] : undefined), obj)
 
-const getPath = (obj, path) => String(path).split('.').reduce(
-  (cur, key) => cur !== null && typeof cur === 'object' ? cur[key] : undefined, obj)
-
-/**
- * 递归查找名为 credit* 的数值字段(有界,避免异常响应导致深递归)。
- * 优先「剩余」语义的键,其次任意 credit 键;同名多取值第一个有限非负数。
- */
-function findCreditField(node, depth = 0) {
-  if (node === null || typeof node !== 'object' || depth > 6) return null
-  const rows = Array.isArray(node) ? node.map((v, i) => [String(i), v]) : Object.entries(node)
-  const named = []
-  for (const [key, value] of rows) {
-    if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) {
-      // TotalCredits / CycleCredits / UsedCredits 是分母或已用量，不是「剩余 credit」。
-      if (/credit/i.test(key) && !/total|cycle|used|spent|consum|quota|limit|max|cap|alloc/i.test(key)) {
-        named.push([key, number(value)])
-      }
-    }
-  }
-  const prefer = named.find(([key, value]) => /remain|available|left|rest|balance/i.test(key) && value !== null && value >= 0)
-  if (prefer) return prefer[1]
-  const any = named.find(([, value]) => value !== null && value >= 0)
-  if (any) return any[1]
-  for (const [, value] of rows) {
-    if (value !== null && typeof value === 'object') {
-      const hit = findCreditField(value, depth + 1)
-      if (hit !== null) return hit
-    }
-  }
-  return null
-}
-
-const DEFAULT_CREDIT_PATHS = [
+/** credit 语义的反向选择：这些词表示分母或已用量，不是「剩余」。 */
+const NOT_REMAINING = /total|cycle|used|spent|consum|quota|limit|max|cap|alloc/i
+const REMAINING = /remain|available|left|rest|balance/i
+const CREDIT_PATHS = [
   'Response.Credit', 'Response.credit', 'Response.Credits', 'Response.credits',
   'Response.CreditBalance', 'Response.RemainCredit', 'Response.RemainingCredit',
-  'Response.AvailableCredit', 'Response.PackageInfo.Credit', 'Response.PackageInfo.CreditBalance',
-  'Credit', 'credit', 'Credits', 'credits',
+  'Response.AvailableCredit', 'Response.PackageInfo.Credit', 'Credit', 'credit',
 ]
 
+/** 有界递归查找 credit* 数值字段（层级上限防异常响应）。 */
+function scanCredit(node, depth = 0) {
+  if (node === null || typeof node !== 'object' || depth > 6) return null
+  const entries = Object.entries(node)
+  let fallback = null
+  for (const [key, raw] of entries) {
+    if (!/credit/i.test(key) || NOT_REMAINING.test(key)) continue
+    const value = toNumber(raw)
+    if (value === null || value < 0) continue
+    if (REMAINING.test(key)) return value
+    fallback ??= value
+  }
+  if (fallback !== null) return fallback
+  for (const [, value] of entries) {
+    const hit = scanCredit(value, depth + 1)
+    if (hit !== null) return hit
+  }
+  return null
+}
+
 /**
- * 从响应里解析【剩余 credit】。纯函数,可单测。
- * 优先用户配置的 creditPath;其次常见 credit 字段路径;再次递归查找;
- * 最后兼容官方 CLI 口径的 TotalCredits / CycleCredits - TotalUsed。
+ * 解析剩余 credit。顺序：显式路径 → 常见路径 → 有界递归 →
+ * TotalCredits/CycleCredits - TotalUsed（当前个人版接口的实测形态）。
  * @returns {{ credit:number, source:string } | null}
  */
 export function parseTencentTokenPlanCredit(data, { creditPath = '' } = {}) {
   if (data === null || typeof data !== 'object') return null
-  const paths = creditPath ? [creditPath] : DEFAULT_CREDIT_PATHS
-  for (const path of paths) {
-    const value = number(getPath(data, path))
+  for (const path of creditPath ? [creditPath] : CREDIT_PATHS) {
+    const value = toNumber(atPath(data, path))
     if (value !== null && value >= 0) return { credit: value, source: path }
   }
-  const scanned = findCreditField(data)
+  const scanned = scanCredit(data)
   if (scanned !== null) return { credit: scanned, source: 'credit field (auto-detected)' }
-  const response = data.Response ?? data
-  const total = number(response?.TotalCredits) ?? number(response?.CycleCredits)
-    ?? number(response?.PackageInfo?.CycleQuota) ?? number(response?.PackageInfo?.TotalQuota)
-  const used = number(response?.TotalUsed) ?? number(response?.PackageInfo?.TotalUsed) ?? 0
-  if (total !== null && total >= 0 && used !== null && used >= 0) {
-    return { credit: Math.max(0, total - used), source: 'TotalCredits - TotalUsed' }
-  }
-  return null
+  const res = data.Response ?? data
+  const total = toNumber(res?.TotalCredits) ?? toNumber(res?.CycleCredits)
+    ?? toNumber(res?.PackageInfo?.CycleQuota) ?? toNumber(res?.PackageInfo?.TotalQuota)
+  const used = toNumber(res?.TotalUsed) ?? toNumber(res?.PackageInfo?.TotalUsed) ?? 0
+  if (total === null || total < 0 || used === null || used < 0) return null
+  return { credit: Math.max(0, total - used), source: 'TotalCredits - TotalUsed' }
 }
 
-/** 归一化单个配置数值(环境变量 / 本地 env 文件都可能是字符串)。 */
-function positiveNumber(value, fallback) {
-  const n = Number(value)
-  return Number.isFinite(n) && n > 0 ? n : fallback
-}
+// ── 凭据 ────────────────────────────────────────────────────────────────
+// 同一来源的 SecretId + SecretKey 才配对，绝不跨来源混搭：逐字段取优先级会拼出
+// 一把不存在的密钥，上游只回 AuthFailure.SecretIdNotFound，极难定位。
 
-/** 读取可选的本地 env 文件里的全部键值(密钥不落进 config,只在查询时读取)。 */
-function readLocalEnvFile() {
+const trim = value => (typeof value === 'string' ? value.trim() : '')
+const envValue = names => names.map(name => trim(process.env[name])).find(Boolean) ?? ''
+
+function localEnvFile() {
   const file = process.env.TENCENT_TOKENPLAN_ENV_FILE || join(homedir(), '.dsh', 'tencent-tokenplan.env')
   let text = ''
   try { text = readFileSync(file, 'utf8') } catch { return {} }
   const values = {}
   for (const line of text.split('\n')) {
-    if (/^\s*(#|$)/.test(line)) continue
     const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/)
-    if (!match) continue
-    const value = match[2].replace(/^['"]|['"]$/g, '').trim()
-    if (value) values[match[1]] = value
+    if (match && match[2]) values[match[1]] = match[2].replace(/^['"]|['"]$/g, '').trim()
   }
   return values
 }
 
-const pickFrom = (values, names) => {
-  for (const name of names) if (values[name]) return values[name]
-  return ''
-}
-
-/** 本地 env 文件里成对的 SecretId/SecretKey。 */
-function readLocalEnvPairs() {
-  const values = readLocalEnvFile()
-  return { id: pickFrom(values, SECRET_ID_NAMES), key: pickFrom(values, SECRET_KEY_NAMES) }
-}
-
-/** 腾讯云 SecretId 形态:AKID 开头、长度 32~64 的字母数字。 */
-const looksLikeSecretId = value => typeof value === 'string' && /^AKID[A-Za-z0-9]{20,80}$/.test(value.trim())
-
-/** 从 DSH 凭据库按候选名取第一个非空值。 */
-async function resolveFromStore(credentials, names) {
+async function storeValue(credentials, names) {
   if (credentials === undefined) return ''
   for (const name of names) {
     try {
       const hit = await credentials.resolve(credentialRef(name))
-      if (typeof hit?.value === 'string' && hit.value.trim()) return hit.value.trim()
-    } catch { /* 尝试下一个候选名 */ }
+      if (trim(hit?.value)) return hit.value.trim()
+    } catch { /* 换下一个候选名 */ }
   }
   return ''
 }
 
-const resolveFromEnv = names => {
-  for (const name of names) {
-    const value = String(process.env[name] ?? '').trim()
-    if (value) return value
-  }
-  return ''
-}
+/** 腾讯云 SecretId 形态：AKID + 20~80 位字母数字。 */
+const isSecretId = value => /^AKID[A-Za-z0-9]{20,80}$/.test(value)
 
 /**
- * 凭据按【来源成对】解析,绝不跨来源混搭 SecretId 与 SecretKey。
- *
- * 逐字段取优先级会把「凭据库里的 SecretId」和「env 文件里的 SecretKey」拼成一把
- * 不存在的密钥,上游只回 AuthFailure.SecretIdNotFound,极难定位。这里改为:依次考察
- * 凭据库 → 进程环境变量 → 本地 env 文件,第一个同时提供两者的来源胜出。
- *
- * 另支持把 "SecretId:SecretKey" 合并填在 SecretId 槽位的形态。
+ * 按来源成对解析：凭据库 → 进程环境变量 → 本地 env 文件，首个同时提供两者的来源胜出。
+ * 支持把 "SecretId:SecretKey" 合并填在 SecretId 槽位。
  */
-async function resolveCredentialPair(ctx) {
+async function resolvePair(ctx) {
   const credentials = ctx?.get?.('credentials')
-  const storeId = await resolveFromStore(credentials, SECRET_ID_NAMES)
-  const storeKey = await resolveFromStore(credentials, SECRET_KEY_NAMES)
-  const envId = resolveFromEnv(SECRET_ID_NAMES)
-  const envKey = resolveFromEnv(SECRET_KEY_NAMES)
-  const fileValues = readLocalEnvPairs()
-  const candidates = [
-    { source: 'credential store', secretId: storeId, secretKey: storeKey },
-    { source: 'environment', secretId: envId, secretKey: envKey },
-    { source: 'local env file', secretId: fileValues.id, secretKey: fileValues.key },
+  const file = localEnvFile()
+  const pick = names => names.map(name => file[name]).find(Boolean) ?? ''
+  const sources = [
+    ['credential store', await storeValue(credentials, ID_NAMES), await storeValue(credentials, KEY_NAMES)],
+    ['environment', envValue(ID_NAMES), envValue(KEY_NAMES)],
+    ['local env file', pick(ID_NAMES), pick(KEY_NAMES)],
   ]
-  // 合并形态 "SecretId:SecretKey" 在各自来源内拆开（只有缺 Key 时才拆）。
-  for (const candidate of candidates) {
-    if (!candidate.secretKey && candidate.secretId.includes(':')) {
-      const idx = candidate.secretId.indexOf(':')
-      const id = candidate.secretId.slice(0, idx).trim()
-      const key = candidate.secretId.slice(idx + 1).trim()
-      if (id && key) {
-        candidate.secretId = id
-        candidate.secretKey = key
-      }
+  let haveId = false
+  let haveKey = false
+  for (const [source, rawId, rawKey] of sources) {
+    let id = rawId
+    let key = rawKey
+    haveId ||= Boolean(id)
+    haveKey ||= Boolean(key)
+    if (id && !key && id.includes(':')) {
+      const cut = id.indexOf(':')
+      key = id.slice(cut + 1).trim()
+      id = id.slice(0, cut).trim()
     }
+    if (id && key) return { secretId: id, secretKey: key, source, haveId, haveKey }
   }
-  for (const candidate of candidates) {
-    if (candidate.secretId && candidate.secretKey) {
-      return { secretId: candidate.secretId, secretKey: candidate.secretKey, source: candidate.source,
-        partial: { id: true, key: true } }
-    }
-  }
-  return { secretId: '', secretKey: '', source: '',
-    partial: { id: Boolean(storeId || envId || fileValues.id), key: Boolean(storeKey || envKey || fileValues.key) } }
+  return { secretId: '', secretKey: '', source: '', haveId, haveKey }
 }
 
-const messages = {
+// ── 文案 ────────────────────────────────────────────────────────────────
+const MESSAGES = {
   zh: {
-    missing: '请填写腾讯云 API 的 SecretId 与 SecretKey（云 API 密钥，不是 sk-tp- 推理 Key）；也可设置环境变量或 ~/.dsh/tencent-tokenplan.env。',
-    network: '腾讯 TokenHub 额度查询网络失败，请稍后重试。',
+    missing: '请填写腾讯云 API 的 SecretId 与 SecretKey（云 API 密钥，不是 sk- 推理 Key）；也可设置环境变量或 ~/.dsh/tencent-tokenplan.env。',
+    missingOne: '凭据只配了一半：缺少 {missing}。SecretId 与 SecretKey 必须成对来自同一把云 API 密钥。',
+    badSecretId: 'SecretId 形态不对（应以 AKID 开头）：来源 {source} 的值形如「{shape}」。sk- 开头的是 Token Plan 推理 Key，不能查额度；请到 https://console.cloud.tencent.com/capi 获取云 API 密钥。',
+    secretIdNotFound: '上游不认识这把 SecretId（AuthFailure.SecretIdNotFound）：通常填成了 sk- 推理 Key，或两个值来自不同密钥对。当前来源：{source}。',
+    signature: '签名校验失败（{code}）：SecretId 与 SecretKey 不配对，或本机时间偏差超过 5 分钟。当前来源：{source}。',
+    auth: '腾讯 TokenHub 鉴权失败：需要主账号密钥，或已授予 TokenHub 管控面读取权限的 CAM 密钥。上游错误码：{code}。',
     http: '腾讯 TokenHub 额度接口返回 HTTP {status}。',
-    auth: '腾讯 TokenHub 鉴权失败：请确认使用主账号密钥，且已授予 TokenHub 管控面读取权限（子账号常见 AuthFailure.UnauthorizedOperation）。上游错误码：{code}。',
-    secretIdNotFound: '腾讯 TokenHub 不认识这把 SecretId（AuthFailure.SecretIdNotFound）：通常是 SecretId 填成了 Token Plan 的推理 API Key（sk- 开头），或 SecretId 与 SecretKey 来自不同密钥对。请填云 API 密钥（AKID 开头，https://console.cloud.tencent.com/capi）。当前生效来源：{source}。',
-    badSecretId: 'SecretId 形态不对（应以 AKID 开头，是云 API 密钥）：当前生效来源 {source} 里是「{shape}」形式的值。sk- 开头的是 Token Plan 推理 Key，不能用于额度查询；请到 https://console.cloud.tencent.com/capi 建/取云 API 密钥。',
-    missingOne: '凭据只配了一半：{missing} 缺失。SecretId 与 SecretKey 必须成对来自同一把云 API 密钥。',
-    signature: '签名校验失败（{code}）：SecretId 与 SecretKey 不是同一把密钥，或本机时间偏差超过 5 分钟。当前生效来源：{source}。',
     api: '腾讯 TokenHub 返回错误：{code} {message}',
+    network: '腾讯 TokenHub 额度查询网络失败，请稍后重试。',
     payload: '腾讯 TokenHub 响应无效或过大，请稍后重试。',
-    credit: '未从腾讯 TokenHub 响应中读取到有效的 credit（剩余积分），未将其记为零余额。可设置 TENCENT_TOKENPLAN_CREDIT_PATH 指定字段路径。',
+    credit: '未从响应中读到有效的 credit（剩余积分），未记为零余额。可用 TENCENT_TOKENPLAN_CREDIT_PATH 指定字段路径。',
   },
   en: {
-    missing: 'Enter the Tencent Cloud API SecretId and SecretKey (cloud API keys, not the sk-tp- inference key), or set env vars / ~/.dsh/tencent-tokenplan.env.',
-    network: 'Tencent TokenHub quota request failed; please retry later.',
+    missing: 'Enter the Tencent Cloud API SecretId and SecretKey (cloud API keys, not an sk- inference key), or set env vars / ~/.dsh/tencent-tokenplan.env.',
+    missingOne: 'Credentials are half configured: {missing} is missing. Both must come from the same cloud API key pair.',
+    badSecretId: 'The SecretId must start with AKID; source {source} holds a "{shape}" value. sk-... is a Token Plan inference key and cannot query quotas. Create cloud API keys at https://console.cloud.tencent.com/capi.',
+    secretIdNotFound: 'Tencent Cloud does not recognize this SecretId (AuthFailure.SecretIdNotFound): usually an sk- inference key, or values from different key pairs. Active source: {source}.',
+    signature: 'Signature verification failed ({code}): the key pair does not match, or the clock is off by more than 5 minutes. Active source: {source}.',
+    auth: 'Tencent TokenHub authentication failed: a root-account key, or a CAM key granted TokenHub control-plane read access, is required. Upstream code: {code}.',
     http: 'Tencent TokenHub returned HTTP {status}.',
-    auth: 'Tencent TokenHub authentication failed: use a root-account key with TokenHub control-plane read permission (sub-accounts commonly get AuthFailure.UnauthorizedOperation). Upstream code: {code}.',
-    secretIdNotFound: 'Tencent TokenHub does not recognize this SecretId (AuthFailure.SecretIdNotFound): the SecretId is usually a Token Plan inference key (sk-...) instead of a cloud API key, or SecretId and SecretKey come from different key pairs. Enter cloud API keys (AKID..., https://console.cloud.tencent.com/capi). Active source: {source}.',
-    badSecretId: 'The SecretId does not look like a cloud API key (must start with AKID). Active source {source} holds a "{shape}" value; sk-... is a Token Plan inference key and cannot query quotas. Create cloud API keys at https://console.cloud.tencent.com/capi.',
-    missingOne: 'Credentials are only half configured: {missing} is missing. SecretId and SecretKey must come as a pair from the same cloud API key.',
-    signature: 'Signature verification failed ({code}): SecretId and SecretKey are not the same key pair, or the local clock is off by more than 5 minutes. Active source: {source}.',
     api: 'Tencent TokenHub error: {code} {message}',
+    network: 'Tencent TokenHub quota request failed; please retry later.',
     payload: 'Tencent TokenHub response is invalid or too large; please retry later.',
-    credit: 'No valid credit (remaining points) in the Tencent TokenHub response; not treated as zero. Set TENCENT_TOKENPLAN_CREDIT_PATH to override the field path.',
+    credit: 'No valid credit (remaining points) in the response; not treated as zero. Set TENCENT_TOKENPLAN_CREDIT_PATH to override the field path.',
   },
 }
-const failure = (locale, key, vars = {}) => {
-  let text = messages[locale === 'en' ? 'en' : 'zh'][key]
+
+function failure(locale, key, vars = {}) {
+  let text = MESSAGES[locale === 'en' ? 'en' : 'zh'][key]
   for (const [name, value] of Object.entries(vars)) text = text.replace(`{${name}}`, String(value))
   return new Error(text)
 }
 
+const softFailure = (locale, key, vars) => Object.assign(failure(locale, key, vars), { soft: true })
+const configured = (name, fallback) => String(process.env[name] ?? '').trim() || fallback
+const round6 = value => Math.round(value * 1e6) / 1e6
+
 /**
- * 查询腾讯 Token Plan 个人版额度。由 custom-balance.js 以 adapter 方式调用。
+ * 查询个人版额度，由 custom-balance.js 以 adapter 方式调用。
  * @returns {{ label:string, unit:'CREDITS', remaining:number, maxBudget:number, spend:number }}
  */
 export async function queryTencentTokenPlan(ctx, config, { fetchImpl = fetch, signal } = {}) {
   signal?.throwIfAborted()
   const locale = config?.locale
-  // 成对解析:同一来源的 SecretId + SecretKey 才配对,绝不跨来源混搭。
-  const pair = await resolveCredentialPair(ctx)
-  const { secretId, secretKey, source } = pair
-  if (!secretId || !secretKey) {
-    const error = pair.partial.id || pair.partial.key
-      ? failure(locale, 'missingOne', { missing: [pair.partial.id ? '' : 'SecretId', pair.partial.key ? '' : 'SecretKey'].filter(Boolean).join(' / ') })
-      : failure(locale, 'missing')
-    error.soft = true
-    throw error
+  const pair = await resolvePair(ctx)
+  if (!pair.secretId || !pair.secretKey) {
+    const missing = [pair.haveId ? '' : 'SecretId', pair.haveKey ? '' : 'SecretKey'].filter(Boolean).join(' / ')
+    throw softFailure(locale, pair.haveId || pair.haveKey ? 'missingOne' : 'missing',
+      pair.haveId || pair.haveKey ? { missing } : {})
   }
-  // 形态先自检:把 sk- 推理 Key 误填进 SecretId 时给出可操作的提示,而不是让上游回 SecretIdNotFound。
-  if (!looksLikeSecretId(secretId)) {
-    const shape = /^sk-/.test(secretId) ? 'sk-…（Token Plan 推理 Key）'
-      : /^AKID/.test(secretId) ? 'AKID…（长度异常）' : secretId.slice(0, 3) + '…'
-    const error = failure(locale, 'badSecretId', { source, shape })
-    error.soft = true
-    throw error
+  if (!isSecretId(pair.secretId)) {
+    const shape = /^sk-/.test(pair.secretId) ? 'sk-…（Token Plan 推理 Key）' : `${pair.secretId.slice(0, 3)}…`
+    throw softFailure(locale, 'badSecretId', { source: pair.source, shape })
   }
 
-  const action = String(process.env.TENCENT_TOKENPLAN_ACTION ?? '').trim() || 'DescribeTokenPlanPersonalPackage'
-  const productType = String(process.env.TENCENT_TOKENPLAN_PRODUCT_TYPE ?? '').trim() || 'personal'
-  const region = String(process.env.TENCENTCLOUD_REGION ?? process.env.TENCENT_TOKENPLAN_REGION ?? '').trim()
-    || TENCENT_TOKENPLAN_DEFAULT_REGION
-  // TeamId / 临时密钥 token 与主密钥同源解析(成对来源,不跨来源混搭)。
-  const sideCredentials = ctx?.get?.('credentials')
-  const teamId = await resolveFromStore(sideCredentials, TEAM_ID_NAMES)
-    || resolveFromEnv(TEAM_ID_NAMES) || pickFrom(readLocalEnvFile(), TEAM_ID_NAMES)
-  const token = await resolveFromStore(sideCredentials, TOKEN_NAMES)
-    || resolveFromEnv(TOKEN_NAMES) || pickFrom(readLocalEnvFile(), TOKEN_NAMES)
+  const action = configured('TENCENT_TOKENPLAN_ACTION', DEFAULT_ACTION)
+  const region = configured('TENCENTCLOUD_REGION', configured('TENCENT_TOKENPLAN_REGION', DEFAULT_REGION))
+  const file = localEnvFile()
+  const sideValue = async names => await storeValue(ctx?.get?.('credentials'), names)
+    || envValue(names) || (names.map(name => file[name]).find(Boolean) ?? '')
+  const teamId = await sideValue(TEAM_NAMES)
+  if (action === 'DescribeTokenPlan' && !teamId) throw softFailure(locale, 'missing')
   const payload = action === 'DescribeTokenPlan'
     ? JSON.stringify({ TeamId: teamId })
-    : JSON.stringify({ ProductType: productType })
-  if (action === 'DescribeTokenPlan' && !teamId) {
-    const error = failure(locale, 'missing')
-    error.soft = true
-    throw error
-  }
+    : JSON.stringify({ ProductType: configured('TENCENT_TOKENPLAN_PRODUCT_TYPE', DEFAULT_PRODUCT_TYPE) })
+  const token = await sideValue(TOKEN_NAMES)
 
   let response
   try {
-    // 每次重试重新生成时间戳/签名;URL、Action、body 均为固定只读查询。
+    // 每次重试重新生成时间戳与签名；请求固定为只读套餐查询。
     response = await fetchWithRetry(TENCENT_TOKENPLAN_URL, { signal }, {
       attempts: 2, timeoutMs: 15000,
       fetchImpl: (url, init) => fetchImpl(url, {
-        ...signTencentTokenPlanRequest(secretId, secretKey, { action, payload, region, token }),
+        ...signTencentTokenPlanRequest(pair.secretId, pair.secretKey, { action, payload, region, token }),
         signal: init.signal,
       }),
     })
@@ -355,40 +287,33 @@ export async function queryTencentTokenPlan(ctx, config, { fetchImpl = fetch, si
     throw failure(locale, 'network')
   }
   if (!response.ok) {
-    try { await response.body?.cancel?.() } catch {}
+    try { await response.body?.cancel?.() } catch { /* 清理失败不掩盖 HTTP 错误 */ }
     if (response.status === 401 || response.status === 403) throw failure(locale, 'auth', { code: response.status })
     throw balanceHttpError(failure(locale, 'http', { status: response.status }).message, response)
   }
+
   let data
   try { data = await readJsonBounded(response, 262144, { signal }) }
   catch { signal?.throwIfAborted(); throw failure(locale, 'payload') }
   if (data === null || typeof data !== 'object') throw failure(locale, 'payload')
-  const apiError = data?.Response?.Error ?? data?.Error
+
+  const apiError = data.Response?.Error ?? data.Error
   if (apiError) {
     const code = String(apiError.Code ?? apiError.code ?? '')
     const message = String(apiError.Message ?? apiError.message ?? '')
-    // 401/403 一类错误要拆开说清楚,否则用户永远只看到「请确认主账号权限」——
-    // 而 SecretIdNotFound / 签名失败其实是「密钥配错/串台」,与权限无关。
-    const kind = /SecretIdNotFound|InvalidSecretId/i.test(code) ? 'secretIdNotFound'
-      : /Signature|SignatureExpire/i.test(code) ? 'signature'
-      : /AuthFailure|UnauthorizedOperation|NotAuthorized/i.test(code) ? 'auth'
-      : null
-    if (kind !== null) {
-      const error = failure(locale, kind, { code, source })
-      error.soft = true
-      error.upstreamCode = code
-      throw error
-    }
+    // 鉴权类错误必须分清：SecretIdNotFound / 签名失败是「密钥配错」，与权限无关。
+    const key = /SecretIdNotFound|InvalidSecretId/i.test(code) ? 'secretIdNotFound'
+      : /Signature/i.test(code) ? 'signature'
+        : /AuthFailure|UnauthorizedOperation|NotAuthorized/i.test(code) ? 'auth'
+          : null
+    if (key !== null) throw Object.assign(softFailure(locale, key, { code, source: pair.source }), { upstreamCode: code })
     throw failure(locale, 'api', { code, message })
   }
-  const parsed = parseTencentTokenPlanCredit(data, {
-    creditPath: String(process.env.TENCENT_TOKENPLAN_CREDIT_PATH ?? '').trim(),
-  })
-  if (parsed === null) throw failure(locale, 'credit')
 
-  const maxBudget = positiveNumber(process.env.TENCENT_TOKENPLAN_MONTHLY_CREDITS, TENCENT_TOKENPLAN_MONTHLY_CREDITS)
-  // 上游已用量带 8 位小数，去掉浮点运算产生的 ...0002 尾数再展示。
-  const round6 = value => Math.round(value * 1e6) / 1e6
+  const parsed = parseTencentTokenPlanCredit(data, { creditPath: configured('TENCENT_TOKENPLAN_CREDIT_PATH', '') })
+  if (parsed === null) throw failure(locale, 'credit')
+  const monthly = Number(configured('TENCENT_TOKENPLAN_MONTHLY_CREDITS', ''))
+  const maxBudget = Number.isFinite(monthly) && monthly > 0 ? monthly : TENCENT_TOKENPLAN_MONTHLY_CREDITS
   const remaining = round6(Math.max(0, Math.min(maxBudget, parsed.credit)))
   return {
     label: config?.customBalance?.label || '腾讯 Token Plan 个人版',
