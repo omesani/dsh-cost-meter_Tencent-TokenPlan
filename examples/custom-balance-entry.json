@@ -1,5 +1,4 @@
 {
-  "_说明": "设置页点击「+ 腾讯 Token Plan 个人版」后生成的条目形状；也可手工对照。request.url 为空是正常的——URL 由 adapter 决定。",
   "adapter": "tencent-tokenplan",
   "enabled": true,
   "label": "腾讯 Token Plan 个人版",
@@ -9,7 +8,11 @@
   "unit": "CREDITS",
   "convertToDisplayCurrency": false,
   "refreshMinutes": 15,
-  "request": { "url": "", "method": "GET", "headers": {} },
+  "request": {
+    "url": "",
+    "method": "GET",
+    "headers": {}
+  },
   "extract": {},
   "allowedHosts": []
 }

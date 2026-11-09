@@ -1,31 +1,28 @@
 #!/usr/bin/env node
-/**
- * 从最近一次安装备份还原 dsh-cost-meter。
- * 用法：node uninstall.mjs [--backup <目录>] [--list]
- */
-import { cpSync, existsSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { options, pluginDir, packageInfo, backupDir, read, hash, inside, commitChanges, run } from './lib/deployment.mjs'
 
-const args = process.argv.slice(2)
-const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
-const root = join(dshHome, 'tencent-tokenplan-backups')
-
-if (args.includes('--list')) {
-  if (!existsSync(root)) { console.log('没有备份。'); process.exit(0) }
-  for (const name of readdirSync(root).sort().reverse()) console.log(name)
-  process.exit(0)
-}
-
-const pluginArg = args.includes('--plugin') ? args[args.indexOf('--plugin') + 1] : ''
-const pluginDir = resolve(pluginArg || join(dshHome, 'profiles', 'web', 'node_modules', 'dsh-cost-meter'))
-if (!existsSync(root)) { console.error('没有备份可还原。'); process.exit(1) }
-const backups = readdirSync(root).sort().reverse()
-if (backups.length === 0) { console.error('备份目录为空。'); process.exit(1) }
-const latest = join(root, backups[0])
-
-console.log(`还原备份: ${latest}`)
-console.log(`目标插件: ${pluginDir}`)
-cpSync(latest, pluginDir, { recursive: true, force: true })
-console.log('已还原。注意：新增文件 lib/tencent-token-plan.js 与 docs/tencent-token-plan.md 不会被删除，')
-console.log('如需彻底移除，请手动删除这两个文件，然后重启 DSH 宿主。')
+await run(() => {
+  const args = options({ backup: { type: 'string' }, list: { type: 'boolean' } })
+  if (args.help) { console.log('用法：node uninstall.mjs --list | --backup <目录> [--profile web] [--plugin <目录>]'); return }
+  if (args.list) {
+    console.log(existsSync(backupDir()) ? readdirSync(backupDir()).sort().reverse().join('\n') : '没有备份。')
+    return
+  }
+  if (!args.backup) throw new Error('请先用 --list 查看，再用 --backup <目录> 明确选择要回退的安装。')
+  const backup = resolve(args.backup)
+  const manifest = JSON.parse(read(join(backup, 'manifest.json')) || 'null')
+  if (manifest?.format !== 1 || !Array.isArray(manifest.files)) throw new Error('此备份缺少新版校验记录；请按 README 的旧备份说明处理。')
+  const dir = args.plugin || args.profile || process.env.DSH_COST_METER_DIR ? pluginDir(args) : resolve(manifest.pluginDir)
+  if (packageInfo(dir).version !== manifest.version) throw new Error('插件版本已变化，不能把旧版本文件覆盖到新版本；请重新安装当前版本的 dsh-cost-meter。')
+  const changes = manifest.files.map(file => {
+    const before = read(inside(dir, file.path))
+    if (hash(before) !== file.afterHash) throw new Error(`安装后文件已变化，停止回退：${file.path}`)
+    const after = file.beforeHash === null ? null : read(inside(backup, file.path))
+    if (hash(after) !== file.beforeHash) throw new Error(`备份内容缺失或已变化：${file.path}`)
+    return { path: file.path, before, after }
+  })
+  commitChanges(dir, changes)
+  console.log('已回退所选安装。env 与账本未修改；请重启 DSH 并刷新网页。')
+})

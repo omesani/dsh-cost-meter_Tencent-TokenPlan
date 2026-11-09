@@ -1,15 +1,5 @@
-/**
- * 针对 dsh-cost-meter 的声明式补丁集（锚点为字面量，逐条可校验）。
- *
- * 设计取舍：
- *  - 不改插件原有逻辑，只做「插入 / 扩白名单 / 加预设」这类最小改动；
- *  - 每条补丁带 guard：已打过就跳过，可重复执行；
- *  - 锚点找不到时明确报错（通常是插件升级改了压缩产物），而不是静默半应用。
- *
- * 基线版本：dsh-cost-meter 1.9.58
- */
-
-export const BASELINE_PLUGIN_VERSION = '1.9.58'
+// dsh-cost-meter 集成补丁；安装前校验全部锚点，重复安装跳过已应用项。
+export const TESTED_PLUGIN_VERSIONS = ['1.9.58', '1.9.60']
 
 /** 新增文件：直接从 files/ 复制到插件同名路径。 */
 export const NEW_FILES = [
@@ -17,7 +7,7 @@ export const NEW_FILES = [
   ['files/docs/tencent-token-plan.md', 'docs/tencent-token-plan.md'],
 ]
 
-/** 字面量替换补丁：file 内 find → replace。已存在 replace 即视为已应用。 */
+// find → replace；正则项另给 installed 检测，命中数量必须一致。
 export const TEXT_PATCHES = [
   // ── custom-balance.js：注册 adapter ──────────────────────────────────
   {
@@ -68,20 +58,11 @@ export const TEXT_PATCHES = [
     replace: "...(['aliyun', 'tokenrhythm', 'tencent-tokenplan'].includes(entry.adapter) ? { adapter: entry.adapter } : {}),",
   },
   {
-    // 固定端点 adapter 的 URL 由 adapter 决定，设置页也不显示该输入框；
-    // 原校验要求「启用时 url 非空」，会让这类条目一启用就报
-    // 「customBalance.request.url 必须是非空字符串」。
     id: 'store/self-resolving-url',
     file: 'lib/store.js',
-    find: "    const request = entry.request\n"
-      + "    // url 仅在启用时必填:默认禁用状态下不能阻断其它配置项的保存。\n"
-      + "    if (request === null || typeof request !== 'object' || Array.isArray(request) || typeof request.url !== 'string' || (entry.enabled === true && request.url.length === 0)) {",
-    replace: "    const request = entry.request\n"
-      + "    // 固定端点 adapter(aliyun / tokenrhythm / tencent-tokenplan)在 queryCustomBalance 里\n"
-      + "    // 早于 request.url 分支返回,URL 由 adapter 自己决定,不需要用户填,也不能用空串卡住保存。\n"
-      + "    const selfResolving = ['aliyun', 'tokenrhythm', 'tencent-tokenplan'].includes(entry.adapter)\n"
-      + "    // url 仅在启用时必填:默认禁用状态下不能阻断其它配置项的保存。\n"
-      + "    if (request === null || typeof request !== 'object' || Array.isArray(request) || typeof request.url !== 'string' || (entry.enabled === true && request.url.length === 0 && !selfResolving)) {",
+    find: '(entry.enabled === true && request.url.length === 0)',
+    replace: "(entry.enabled === true && request.url.length === 0 && !['aliyun', 'tokenrhythm', 'tencent-tokenplan'].includes(entry.adapter))",
+    accept: ["const selfResolving = ['aliyun', 'tokenrhythm', 'tencent-tokenplan'].includes(entry.adapter)", '(entry.enabled === true && request.url.length === 0 && !selfResolving)'],
   },
 
   // ── typert.host.js：RPC 配置 schema（两处）────────────────────────────
@@ -90,7 +71,6 @@ export const TEXT_PATCHES = [
     file: 'lib/typert.host.js',
     find: "z.enum(['custom', 'aliyun', 'tokenrhythm']).optional()",
     replace: "z.enum(['custom', 'aliyun', 'tokenrhythm', 'tencent-tokenplan']).optional()",
-    all: true,
     expect: 2,
   },
 
@@ -98,34 +78,36 @@ export const TEXT_PATCHES = [
   {
     id: 'worker/adapter-allowlist',
     file: 'lib/ledger-writer-worker.js',
-    find: '["aliyun","tokenrhythm"].includes(k.adapter)',
-    replace: '["aliyun","tokenrhythm","tencent-tokenplan"].includes(k.adapter)',
+    find: /\["aliyun","tokenrhythm"\]\.includes\(([\w$]+)\.adapter\)/g,
+    replace: (_, entry) => `["aliyun","tokenrhythm","tencent-tokenplan"].includes(${entry}.adapter)`,
+    installed: /\["aliyun","tokenrhythm","tencent-tokenplan"\]\.includes\([\w$]+\.adapter\)/g,
   },
 
   // ── client.js：设置页白名单、预设按钮、凭据输入框（压缩产物，锚点唯一）──
   {
     id: 'client/adapter-allowlist',
     file: 'lib/client.js',
-    find: '["aliyun","tokenrhythm"].includes(s.adapter)?{adapter:s.adapter}:{}',
-    replace: '["aliyun","tokenrhythm","tencent-tokenplan"].includes(s.adapter)?{adapter:s.adapter}:{}',
+    find: /\["aliyun","tokenrhythm"\]\.includes\(([\w$]+)\.adapter\)\?\{adapter:\1\.adapter\}:\{\}/g,
+    replace: (_, entry) => `["aliyun","tokenrhythm","tencent-tokenplan"].includes(${entry}.adapter)?{adapter:${entry}.adapter}:{}`,
+    installed: /\["aliyun","tokenrhythm","tencent-tokenplan"\]\.includes\(([\w$]+)\.adapter\)\?\{adapter:\1\.adapter\}:\{\}/g,
   },
   {
     id: 'client/self-resolving-flag',
     file: 'lib/client.js',
-    find: 'u=s.adapter==="aliyun",d=s.adapter==="tokenrhythm",m=u||d,[g,b]=L(!1)',
-    replace: 'u=s.adapter==="aliyun",d=s.adapter==="tokenrhythm",q=s.adapter==="tencent-tokenplan",m=u||d||q,[g,b]=L(!1)',
+    find: 'u=s.adapter==="aliyun",d=s.adapter==="tokenrhythm",m=u||d,',
+    replace: 'u=s.adapter==="aliyun",d=s.adapter==="tokenrhythm",q=s.adapter==="tencent-tokenplan",m=u||d||q,',
   },
   {
     id: 'client/credential-vars',
     file: 'lib/client.js',
     find: ':d?["TOKENRHYTHM_COOKIE"]:[...new Set(Object.values(s.request?.headers??{})',
-    replace: ':d?["TOKENRHYTHM_COOKIE"]:q?["TENCENTCLOUD_SECRET_ID","TENCENTCLOUD_SECRET_KEY","TENCENT_TOKENPLAN_TEAM_ID"]:[...new Set(Object.values(s.request?.headers??{})',
+    replace: ':d?["TOKENRHYTHM_COOKIE"]:q?["TENCENTCLOUD_SECRET_ID","TENCENTCLOUD_SECRET_KEY"]:[...new Set(Object.values(s.request?.headers??{})',
   },
   {
     id: 'client/config-note',
     file: 'lib/client.js',
     find: 'a(d?"tokenRhythmBalanceNote":u?"aliyunBalanceNote":"customBalanceConfigNote")',
-    replace: 'q?(H(w)==="en"?"Queries Tencent Cloud TokenHub directly with TC3 signing. Enter the cloud API SecretId/SecretKey below. The endpoint returns only the remaining credit; used points and the percentage are computed against the 1,980 monthly total.":"插件以 TC3 签名直连腾讯云 TokenHub 查询；在下方填写云 API 的 SecretId/SecretKey。接口只返回剩余 credit（积分），已用与完整比例按月总量 1980 积分自行计算。") :a(d?"tokenRhythmBalanceNote":u?"aliyunBalanceNote":"customBalanceConfigNote")',
+    replace: 'q?(H(w)==="en"?"Reads cloud API credentials from ~/.dsh/tencent-tokenplan.env first; no need to enter them again. Remaining credits = total credits minus used credits. The progress bar uses a total of 1,980 credits by default.":"优先读取 ~/.dsh/tencent-tokenplan.env 中的云 API 密钥，无需重复填写。剩余积分 = 总积分 − 已用积分；进度条默认按总额 1980 积分计算。") :a(d?"tokenRhythmBalanceNote":u?"aliyunBalanceNote":"customBalanceConfigNote")',
   },
   {
     // 积分单位不做汇率换算，隐藏「折算成显示货币」开关与说明。

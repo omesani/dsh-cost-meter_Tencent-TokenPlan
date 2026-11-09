@@ -1,141 +1,111 @@
-# dsh-cost-meter · 腾讯 Token Plan 个人版额度
+# 腾讯 Token Plan 个人版 · dsh-cost-meter 补丁
 
-给 [dsh-cost-meter](https://github.com/Han-1413141/dsh-cost-meter) 增加一个**原生**额度来源：
-插件用云 API 的 SecretId/SecretKey 做 TC3-HMAC-SHA256 签名，直连
-`https://tokenhub.tencentcloudapi.com/` 查询「通用 Token Plan 个人版」剩余积分，
-在侧栏与设置页显示**剩余积分 / 已用积分 / 进度条百分比**。
+在 dsh-cost-meter 的侧栏和设置页显示腾讯 Token Plan 个人版的剩余 Credits、已用 Credits 与进度条。直接使用现有 env 密钥，无需中继服务。
 
-不需要额外中继进程。
+Node.js ≥20；已验证 dsh-cost-meter **1.9.58、1.9.60**。其他版本按实际代码预检，不能保证所有后续版本自动兼容。
 
-## 支持版本
+## 部署
 
-| 组件 | 版本 |
-| --- | --- |
-| dsh-cost-meter | **1.9.58**（基线，补丁锚点按此校验） |
-| DeepSeek Harness | 0.2.2-rc.1 |
-| Node.js | >= 20 |
-
-验证日期 2026-11-07。非基线版本也会尝试，锚点不匹配时明确报错，不会半应用。
-
-## 特性
-
-- **接口只给用量，比例自算**：`remaining = credit`、`spend = 1980 - credit`、`maxBudget = 1980`。
-- **月总量可改**：1980 对应通用 **Standard**；Lite 780 / Pro 5980 / Max 11980，
-  Hy 系列 560 / 1560 / 4760 / 9360，用 `TENCENT_TOKENPLAN_MONTHLY_CREDITS` 覆盖。
-- **凭据成对解析**：SecretId 与 SecretKey 必须同源，绝不跨来源拼成假密钥。
-- **形态自检**：SecretId 不以 `AKID` 开头（如误填 `sk-` 推理 Key）时，发请求前就报错并指出生效来源。
-- **错误码分明**：`SecretIdNotFound` / `SignatureFailure` / `UnauthorizedOperation` 各自提示。
-
-## 安装
+在本仓库目录运行，默认目标是 DSH 的 `web` 配置：
 
 ```bash
-git clone https://github.com/omesani/dsh-cost-meter_Tencent-TokenPlan.git
-cd dsh-cost-meter_Tencent-TokenPlan
-node install.mjs      # 自动定位插件并应用（幂等）
-node verify.mjs       # 自检，全部使用假密钥
+node install.mjs --dry-run
+node install.mjs
 ```
+
+安装成功只表示代码已写入。**重启 DSH 宿主，再刷新网页**；仅刷新网页可能仍使用旧的后端代码。
+
+首次使用，在 **设置 → 费用 → 额度** 添加「腾讯 Token Plan 个人版」，启用并选择在侧栏显示。到 **费用 → 显示** 打开「余额进度条」，关闭「仅文字」。进度条是 cost-meter 自带组件，补丁只提供积分数据。
+
+最后检查：
 
 ```bash
-node install.mjs --dry-run             # 预览
-node install.mjs --plugin <插件目录>    # 手动指定
-node install.mjs --force               # 非基线版本也尝试
+node check.mjs --live
 ```
 
-改动前会备份到 `~/.dsh/tencent-tokenplan-backups/<时间戳>/`。
+它检查磁盘补丁、账本开关，并用现有 env / 进程密钥发起一次真实只读查询。然后在网页的腾讯条目点击「刷新」，确认侧栏数值和进度条。
 
-## 配置密钥
+**代码安装成功、接口查询成功、网页显示正常是三个不同的验收结果。** `check.mjs` 不会替你重启宿主或操作网页。
 
-**云 API 密钥**（SecretId 以 `AKID` 开头，在 <https://console.cloud.tencent.com/capi> 获取），
-**不是** `sk-tp-` 推理 Key；需主账号或已授予 TokenHub 管控面读取权限的 CAM 子账号。
-SecretId 与 SecretKey 必须成对。
+## cost-meter 升级后
 
-任选一种来源（优先级：DSH 凭据库 → 环境变量 → 本地文件）：
+1. 更新本补丁源码；Git 版本可运行 `git pull --ff-only`，ZIP 版本替换为新的修订源码目录。
+2. 在补丁目录重新运行 `node install.mjs`。若预检失败，插件文件保持原样；不要绕过错误继续使用。
+3. 重启 DSH 宿主并刷新网页。
+4. 运行 `node check.mjs --live`，再在网页确认结果。
 
-```bash
-cp examples/tencent-tokenplan.env.example ~/.dsh/tencent-tokenplan.env
-chmod 600 ~/.dsh/tencent-tokenplan.env
-# 填入真实值
-```
+升级通常会覆盖插件文件，也可能把不认识的 `adapter` 配置清掉。若旧腾讯条目变成普通自定义请求或提示 URL 为空，用「腾讯 Token Plan 个人版」预设重建该条目，再删除停用的旧条目；**不需要重填 env 密钥**。
+
+脚本只修改插件代码，**不修改 env、账本、模型配置，也不自动重启 DSH**。
+
+## 密钥与积分
+
+默认读取 `~/.dsh/tencent-tokenplan.env`；设置了 `DSH_HOME` 时改读其目录下的同名文件。已有文件直接保留。
 
 ```dotenv
 TENCENTCLOUD_SECRET_ID=***
 TENCENTCLOUD_SECRET_KEY=***
 ```
 
-也可以在设置页卡片的凭据输入框里填（写入 DSH 凭据库，不下发明文）。
+首次创建文件可参考 `examples/tencent-tokenplan.env.example`，将权限设为 `600`；已有文件不要覆盖。
 
-## 启用
+使用腾讯云 **云 API 密钥**，SecretId 应以 `AKID` 开头，`sk-tp-` 推理 Key 无法查询套餐额度。是否有查询权限应以实际请求结果为准，不能根据旧注释推断。
 
-1. **重启 DSH 宿主**并刷新页面（宿主侧代码启动时加载）。
-2. **设置 → 费用 → 额度 → 自定义 Provider 余额 →** 点 **+ 腾讯 Token Plan 个人版**。
-3. 打开「启用」→ 点「刷新」。
+凭据优先级：**env 文件 → 进程环境 → 原有 DSH 凭据库**。只使用同一来源的完整密钥对，临时 Token 也与密钥同源。每次查询重新读取 env，修改文件后点击刷新即可。
 
-卡片默认：单位 `CREDITS`、15 分钟刷新、跳转链接指向
-<https://console.cloud.tencent.com/tokenhub/tokenplan/common>。
+| 可选配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `TENCENT_TOKENPLAN_MONTHLY_CREDITS` | `1980` | 显示总积分，必须大于零 |
+| `TENCENTCLOUD_REGION` | `ap-guangzhou` | 查询地域 |
+| `TENCENT_TOKENPLAN_PRODUCT_TYPE` | `personal` | Hy 个人版可用 `personal-hunyuan` |
+| `TENCENT_TOKENPLAN_CREDIT_PATH` | 空 | 特殊响应的剩余积分点分路径 |
+| `TENCENTCLOUD_TOKEN` | 空 | 临时密钥的会话 Token |
+| `TENCENT_TOKENPLAN_ENV_FILE` | 上述默认文件 | 自定义文件路径，必须在宿主进程环境中指定 |
 
-## 插件或 DSH 升级后
+除文件路径外，可选配置可写入 env 文件；同名进程环境配置优先。env 支持普通赋值、引号、`export` 和行尾注释，不执行 shell 命令或变量展开。
 
-```bash
-git pull
-node install.mjs      # 把补丁重新打到新版本
-node verify.mjs
+当前个人版响应的计算：
+
+```text
+剩余积分 = TotalCredits - TotalUsed
+显示总额 = 1980（或显式配置）
+显示已用 = max(0, 显示总额 - 剩余积分)
+剩余比例 = 剩余积分 / 显示总额
 ```
 
-升级会覆盖 `node_modules`，**每次升级插件后都要重跑 `install.mjs`**。
-已应用的条目自动跳过；压缩产物变化导致锚点位移时会列出具体失败项。
+也接受明确的剩余积分字段。缺失或无效数据会报错，不会假装成零余额或满额。真实积分不会被截断到配置的显示上限；进度条的宽度由原组件限制。
 
-## 卸载
+本项目只查询个人版套餐，固定调用 `DescribeTokenPlanPersonalPackage`。不再使用旧的企业版 Action / TeamId 配置。
 
-```bash
-node uninstall.mjs --list     # 查看备份
-node uninstall.mjs            # 还原最近一次
-```
+## 命令
 
-新增的 `lib/tencent-token-plan.js` 与 `docs/tencent-token-plan.md` 不会被自动删除。
+| 命令 | 用途 |
+| --- | --- |
+| `node install.mjs --dry-run` | 只预检，不写入 |
+| `node install.mjs` | 预检、备份并安装；重复执行零重复改动 |
+| `node check.mjs` | 只检查磁盘代码与本地配置，不发网络请求 |
+| `node check.mjs --live` | 额外验证真实腾讯接口，不输出密钥 |
+| `node verify.mjs` | 用模拟响应做集成自检，不能代替真实查询 |
+| `node uninstall.mjs --list` | 列出安装备份 |
+| `node uninstall.mjs --backup <目录>` | 回退指定的一次安装 |
 
-## 可选环境变量
+部署、检查、自检和回退都支持 `--profile desktop` 或 `--plugin <插件目录>`；默认 `--profile web`。也可用 `DSH_COST_METER_DIR` 指定插件目录。
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `TENCENT_TOKENPLAN_MONTHLY_CREDITS` | `1980` | 月积分总量（分母） |
-| `TENCENT_TOKENPLAN_CREDIT_PATH` | 空 | credit 字段点分路径 |
-| `TENCENT_TOKENPLAN_PRODUCT_TYPE` | `personal` | `personal-hunyuan` 切 Hy 系列 |
-| `TENCENT_TOKENPLAN_ACTION` | `DescribeTokenPlanPersonalPackage` | 改 `DescribeTokenPlan` 走企业版（需 TeamId） |
-| `TENCENT_TOKENPLAN_TEAM_ID` | 空 | 企业版套餐 ID |
-| `TENCENTCLOUD_REGION` | `ap-guangzhou` | 请求地域 |
-| `TENCENT_TOKENPLAN_ENV_FILE` | `~/.dsh/tencent-tokenplan.env` | 密钥文件路径 |
-| `DSH_COST_METER_DIR` | 自动探测 | 插件目录 |
+备份位于 `$DSH_HOME/tencent-tokenplan-backups/`。回退会核对插件版本、当前文件及备份内容，避免覆盖升级或手工修改。**回退最近一次小更新，不等于卸载之前所有补丁。** 要完全恢复官方代码，重新安装对应版本的 dsh-cost-meter，再重启 DSH。新版回退脚本不自动处理缺少内容校验记录的旧备份。
 
-## 排错
+## 常见问题
 
-| 现象 | 原因 | 处理 |
-| --- | --- | --- |
-| `AuthFailure.SecretIdNotFound` | SecretId 填成 `sk-` 推理 Key，或两值不同源 | 填 `AKID` 开头的云 API 密钥 |
-| `AuthFailure.SignatureFailure` | 密钥不配对，或时间偏差 > 5 分钟 | 核对密钥对、校准时间 |
-| `AuthFailure.UnauthorizedOperation` | 密钥有效但无 TokenHub 管控面权限 | 主账号授权 |
-| `未读取到有效的 credit` | 响应结构变化 | 用 `TENCENT_TOKENPLAN_CREDIT_PATH` 指定 |
-| 启用报 `request.url 必须是非空字符串` | 旧版校验未豁免固定端点 adapter | 重跑 `install.mjs` 后重启 |
+| 现象 | 下一步 |
+| --- | --- |
+| 预检提示某个锚点不匹配 | 保留插件版本号与失败项，按[维护说明](docs/maintenance.md)更新对应补丁；目标文件未改动 |
+| 安装写入被系统拒绝 | 使用有权写入 DSH 插件目录的终端或批准该次必要写入，再重试 |
+| 网页仍拒绝 `tencent-tokenplan` / 要求填写 URL | 先确认补丁完整，再重启 DSH；升级丢失标记时重建腾讯条目 |
+| 查询正常但没有条 | 打开「余额进度条」，关闭「仅文字」，确认条目在侧栏显示 |
+| `SecretIdNotFound` | 检查 SecretId 是否有效，不要使用推理 Key |
+| `SignatureFailure` | 核对密钥配对与本机时间 |
+| 鉴权或权限错误 | 按真实错误码检查密钥有效性及套餐查询权限 |
+| 页面凭据输入框显示「未配置」 | 该状态只反映凭据库；env 凭据以实际刷新结果为准 |
 
-## 安全
+接口使用 [TC3 签名](https://cloud.tencent.com/document/api/1823/132284)，只访问固定的 `tokenhub.tencentcloudapi.com`，禁止跟随重定向。SecretKey 只参与本地签名。标准个人版 1980 积分依据[套餐概览](https://cloud.tencent.com/document/product/1823/130060)。
 
-- 仓库不含任何真实密钥；文档与示例中的凭据一律以 `***` 表示。
-- SecretKey 只参与本地 HMAC 派生，**不出现在任何请求头**；SecretId 仅在
-  `Authorization` 的 `Credential` 中。
-- 只请求 `tokenhub.tencentcloudapi.com`，禁止跟随重定向；响应中的账户身份与
-  RequestId 不下发浏览器。
-- `verify.mjs` 全程假密钥、无真实网络请求。
-
-## 接口依据
-
-- [DescribeTokenPlan（企业版）](https://cloud.tencent.com/document/product/1823/132270) ·
-  [DescribeTokenPlanList](https://cloud.tencent.com/document/product/1823/132269)
-- [公共参数 service=tokenhub](https://cloud.tencent.com/document/api/1823/132283) ·
-  [签名方法 v3](https://cloud.tencent.com/document/api/1823/132284)
-- [个人版套餐概览（Standard 1980 积分）](https://cloud.tencent.com/document/product/1823/130060) ·
-  [积分抵扣规则](https://cloud.tencent.com/document/product/1823/133811)
-
-个人版实际调用 `DescribeTokenPlanPersonalPackage`（同域名/同 Version/同签名，无需 TeamId）。
-
-## 许可
-
-MIT。本项目是给 MIT 许可的 dsh-cost-meter 做的最小改动补丁，原始版权归其作者。
+MIT，保留原项目版权。

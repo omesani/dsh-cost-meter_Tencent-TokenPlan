@@ -7,21 +7,20 @@
  */
 import assert from 'node:assert/strict'
 import { createHash, createHmac } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { existsSync, readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { options, pluginDir } from './lib/deployment.mjs'
 
-const args = process.argv.slice(2)
-const pluginArg = args.includes('--plugin') ? args[args.indexOf('--plugin') + 1] : ''
-const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
-const PLUGIN = resolve(pluginArg || process.env.DSH_COST_METER_DIR
-  || join(dshHome, 'profiles', 'web', 'node_modules', 'dsh-cost-meter'))
+const args = options()
+if (args.help) { console.log('用法：node verify.mjs [--profile web] [--plugin <目录>]'); process.exit(0) }
+const PLUGIN = pluginDir(args)
 
 // 隔离真实密钥来源：任何用例都不得读到本机真实 env 文件。
 process.env.TENCENT_TOKENPLAN_ENV_FILE = '/nonexistent/tencent-tokenplan.env'
-for (const name of ['TENCENTCLOUD_SECRET_ID', 'TENCENTCLOUD_SECRET_KEY', 'TENCENTCLOUD_TOKEN',
-  'TENCENT_TOKENPLAN_MONTHLY_CREDITS', 'TENCENT_TOKENPLAN_CREDIT_PATH', 'TENCENT_TOKENPLAN_ACTION',
-  'TENCENT_TOKENPLAN_PRODUCT_TYPE', 'TENCENT_TOKENPLAN_TEAM_ID']) delete process.env[name]
+for (const name of Object.keys(process.env)) {
+  if (/^TENCENT/.test(name) && name !== 'TENCENT_TOKENPLAN_ENV_FILE') delete process.env[name]
+}
 
 // 假密钥运行时拼接，避免仓库出现形似真实密钥的字面量（防扫描器误报）。
 const FAKE_ID = ['AKID', 'FAKE', 'FAKE', 'FAKE', '0'.repeat(20)].join('')
@@ -49,7 +48,7 @@ const { signTencentTokenPlanRequest, parseTencentTokenPlanCredit, queryTencentTo
 
 console.log(`插件: ${PLUGIN}@${JSON.parse(read('package.json')).version}\n`)
 
-// 1. TC3 签名：与官方规范独立重算比对，且 SecretKey 不出站。
+// 1. TC3 签名：独立重算比对，且 SecretKey 不出站。
 {
   const payload = '{"ProductType":"personal"}'
   const ts = 1780000000
@@ -72,14 +71,14 @@ console.log(`插件: ${PLUGIN}@${JSON.parse(read('package.json')).version}\n`)
   const signingKey = hm('tc3_request', hm('tokenhub', hm(date, 'TC3' + FAKE_KEY)))
   assert.equal(req.headers.authorization,
     `TC3-HMAC-SHA256 Credential=${FAKE_ID}/${scope}, SignedHeaders=content-type;host, Signature=${hm(toSign, signingKey, 'hex')}`)
-  ok('TC3 签名与官方规范逐字节一致，SecretKey 未出站')
+  ok('TC3 签名与独立重算结果一致，SecretKey 未出站')
 }
 
 // 2. credit 解析：单值、字符串、自定义路径、真实响应形态、非法值。
 {
   assert.equal(TENCENT_TOKENPLAN_MONTHLY_CREDITS, 1980)
   assert.deepEqual(TENCENT_TOKENPLAN_CREDENTIAL_VARS,
-    ['TENCENTCLOUD_SECRET_ID', 'TENCENTCLOUD_SECRET_KEY', 'TENCENT_TOKENPLAN_TEAM_ID'])
+    ['TENCENTCLOUD_SECRET_ID', 'TENCENTCLOUD_SECRET_KEY'])
   const parse = parseTencentTokenPlanCredit
   assert.equal(parse({ Response: { credit: 1234 } }).credit, 1234)
   assert.equal(parse({ credit: '1234.5' }).credit, 1234.5)
@@ -91,6 +90,13 @@ console.log(`插件: ${PLUGIN}@${JSON.parse(read('package.json')).version}\n`)
   assert.ok(Math.abs(live.credit - 1424.00122064) < 1e-9, '不能把 TotalCredits 误当成剩余值')
   assert.equal(parse({ Response: { credit: -1 } }), null)
   assert.equal(parse({}), null)
+  assert.equal(parse({ Response: { TotalCredits: '1980' } }), null)
+  assert.equal(parse({ Response: { TotalCredits: '1980', TotalUsed: 'bad' } }), null)
+  assert.equal(parse({ Response: { TotalCredits: '1980', TotalUsed: -1 } }), null)
+  assert.equal(parse({ Response: { TotalCredits: '1980', TotalUsed: '0' } }).credit, 1980)
+  assert.equal(parse({ Response: { TotalCredits: '1980', TotalUsed: '2000' } }).credit, 0)
+  assert.equal(parse(real, { creditPath: 'Response.missing' }), null)
+  assert.equal(parse({ Response: { PromotionalCredit: 999 } }), null)
   ok('credit 解析：单值 / 字符串 / 自定义路径 / 真实形态 / 非法值拒绝')
 }
 
@@ -108,6 +114,7 @@ process.env.TENCENTCLOUD_SECRET_KEY = FAKE_KEY
     { label: '腾讯 Token Plan 个人版', unit: 'CREDITS', remaining: 1234, maxBudget: 1980, spend: 746 })
   assert.equal(captured.url, 'https://tokenhub.tencentcloudapi.com/')
   assert.equal(captured.init.body, '{"ProductType":"personal"}')
+  assert.equal(captured.init.headers['x-tc-action'], 'DescribeTokenPlanPersonalPackage')
   assert.ok(captured.init.headers.authorization.startsWith('TC3-HMAC-SHA256 '))
   ok('查询链路：个人版 Action / ProductType / 签名头 / 1980 分母 / spend=746')
 }
@@ -154,10 +161,13 @@ process.env.TENCENTCLOUD_SECRET_KEY = FAKE_KEY
   assert.equal((await queryTencentTokenPlan(storeCtx({ id: BAD_ID }), CONFIG, { fetchImpl: okFetch })).remaining, 100)
 
   let called = false
+  const savedId = process.env.TENCENTCLOUD_SECRET_ID
+  process.env.TENCENTCLOUD_SECRET_ID = BAD_ID
   await assert.rejects(
     () => queryTencentTokenPlan(storeCtx({ id: BAD_ID, key: 'x'.repeat(32) }), CONFIG, {
       fetchImpl: async () => { called = true; throw new Error('should not fetch') } }),
-    err => /AKID/.test(err.message) && /credential store/.test(err.message) && err.soft === true)
+    err => /AKID/.test(err.message) && /environment/.test(err.message) && err.soft === true)
+  process.env.TENCENTCLOUD_SECRET_ID = savedId
   assert.equal(called, false, '形态错误时不应发起上游请求')
   ok('凭据成对解析：半配置来源被跳过；sk- 形态当场识别且不发请求')
 }
@@ -169,7 +179,7 @@ process.env.TENCENTCLOUD_SECRET_KEY = FAKE_KEY
   await assert.rejects(() => queryTencentTokenPlan(NO_CTX, CONFIG, { fetchImpl: withError('AuthFailure.SecretIdNotFound') }),
     err => /SecretIdNotFound/.test(err.message) && err.upstreamCode === 'AuthFailure.SecretIdNotFound')
   await assert.rejects(() => queryTencentTokenPlan(NO_CTX, CONFIG, { fetchImpl: withError('AuthFailure.UnauthorizedOperation') }),
-    err => /主账号/.test(err.message))
+    err => /查询权限/.test(err.message))
   ok('错误码映射：SecretIdNotFound 与权限不足分别提示')
 }
 
@@ -195,7 +205,6 @@ process.env.TENCENTCLOUD_SECRET_KEY = FAKE_KEY
     ['lib/custom-balance.js', "from './tencent-token-plan.js'"],
     ['lib/custom-balance.js', "if (custom.adapter === 'tencent-tokenplan')"],
     ['lib/store.js', "'tencent-tokenplan'"],
-    ['lib/store.js', 'const selfResolving ='],
     ['lib/typert.host.js', "z.enum(['custom', 'aliyun', 'tokenrhythm', 'tencent-tokenplan'])"],
     ['lib/ledger-writer-worker.js', '["aliyun","tokenrhythm","tencent-tokenplan"].includes(k.adapter)'],
     ['lib/client.js', 'k("tencent-tokenplan")'],
@@ -206,6 +215,70 @@ process.env.TENCENTCLOUD_SECRET_KEY = FAKE_KEY
   assert.ok(pkg.dshhub.permissions.network.includes('https://tokenhub.tencentcloudapi.com'), '网络白名单缺失')
   assert.ok(pkg.files.includes('docs/tencent-token-plan.md'), 'files 清单缺文档')
   ok('静态检查：adapter / 白名单 / 预设 / 网络权限 / 文档清单全部就位')
+}
+
+// env 文件及进程环境的凭据、Token 不得混用；文件配置无需写入凭据库。
+{
+  const dir = mkdtempSync(join(tmpdir(), 'tokenplan-test-'))
+  const path = join(dir, 'test.env')
+  const previousPath = process.env.TENCENT_TOKENPLAN_ENV_FILE
+  try {
+    process.env.TENCENT_TOKENPLAN_ENV_FILE = path
+    writeFileSync(path, [
+      `export TENCENTCLOUD_SECRET_ID="${FAKE_ID}" # file credentials`,
+      `TENCENTCLOUD_SECRET_KEY='${FAKE_KEY}'`,
+      'TENCENTCLOUD_TOKEN=file-token # same source',
+      'TENCENT_TOKENPLAN_MONTHLY_CREDITS=2000',
+      'TENCENTCLOUD_REGION=ap-shanghai',
+    ].join('\n'), { mode: 0o600 })
+    process.env.TENCENTCLOUD_SECRET_ID = 'sk-invalid-process-key'
+    process.env.TENCENTCLOUD_TOKEN = 'wrong-process-token'
+    let captured
+    const fetchImpl = async (url, init) => {
+      captured = init
+      return new Response(JSON.stringify({ Response: { TotalCredits: 1980, TotalUsed: 601.571 } }))
+    }
+    const result = await queryTencentTokenPlan(NO_CTX, CONFIG, { fetchImpl })
+    assert.equal(result.remaining, 1378.429)
+    assert.equal(result.maxBudget, 2000)
+    assert.equal(captured.headers['x-tc-token'], 'file-token')
+    assert.equal(captured.headers['x-tc-region'], 'ap-shanghai')
+    assert.equal(captured.headers['accept-encoding'], 'identity')
+    writeFileSync(path, `TENCENTCLOUD_SECRET_ID=${FAKE_ID}\nTENCENTCLOUD_SECRET_KEY=${FAKE_KEY}`)
+    const withoutToken = await queryTencentTokenPlan(NO_CTX, CONFIG, { fetchImpl })
+    assert.equal(withoutToken.maxBudget, 1980)
+    assert.equal(captured.headers['x-tc-token'], undefined)
+    assert.equal(withoutToken.spend, 601.571)
+    process.env.TENCENTCLOUD_SECRET_ID = FAKE_ID
+    writeFileSync(path, `TENCENTCLOUD_SECRET_ID=${FAKE_ID}`)
+    await queryTencentTokenPlan(NO_CTX, CONFIG, { fetchImpl })
+    assert.equal(captured.headers['x-tc-token'], 'wrong-process-token')
+    ok('env 文件优先、可选配置生效、凭据与临时 Token 同源、默认 1980 分母')
+  } finally {
+    process.env.TENCENT_TOKENPLAN_ENV_FILE = previousPath
+    process.env.TENCENTCLOUD_SECRET_ID = FAKE_ID
+    delete process.env.TENCENTCLOUD_TOKEN
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// 配置错误在发送请求前报告，不静默回落到默认总额。
+{
+  let called = false
+  process.env.TENCENT_TOKENPLAN_MONTHLY_CREDITS = 'invalid'
+  await assert.rejects(() => queryTencentTokenPlan(NO_CTX, CONFIG, {
+    fetchImpl: async () => { called = true; throw new Error('must not fetch') },
+  }), /MONTHLY_CREDITS/)
+  assert.equal(called, false)
+  delete process.env.TENCENT_TOKENPLAN_MONTHLY_CREDITS
+  const result = await queryTencentTokenPlan(NO_CTX, CONFIG, {
+    fetchImpl: async () => new Response(JSON.stringify({ Response: { credit: 2000 } })),
+  })
+  assert.equal(result.remaining, 2000, '真实积分不应被显示分母截断')
+  assert.equal(result.spend, 0)
+  const controller = new AbortController(); controller.abort()
+  await assert.rejects(() => queryTencentTokenPlan(NO_CTX, CONFIG, { signal: controller.signal }), error => error.name === 'AbortError')
+  ok('非法总额提前失败、保留真实积分、取消请求即时生效')
 }
 
 console.log(`\n全部 ${passed} 组检查通过。`)
